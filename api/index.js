@@ -1,55 +1,75 @@
-// 强制部署在美国东部节点，减少到 OpenAI 的网络绕行。
 export const config = {
-  runtime: 'edge',
-  regions: ['iad1']
+  api: {
+    bodyParser: false
+  }
 };
 
-export default async function reqHandler(req) {
+async function readRawBody(req) {
+  const chunks = [];
+  for await (const chunk of req) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  return chunks.length ? Buffer.concat(chunks) : undefined;
+}
+
+export default async function reqHandler(req, res) {
   // 处理跨域请求 (CORS)
   if (req.method === 'OPTIONS') {
-    return new Response(null, {
-      headers: {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-      }
-    });
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader(
+      'Access-Control-Allow-Methods',
+      'GET, POST, PUT, DELETE, OPTIONS'
+    );
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.status(204).end();
+    return;
   }
 
-  // 1. 将当前请求映射到 OpenAI 官方 API
-  const url = new URL(req.url);
-  const targetUrl = `https://api.openai.com${url.pathname}${url.search}`;
+  const targetUrl = `https://api.openai.com${req.url}`;
 
-  // 2. 清洗 Header，避免泄露来源 IP，并移除容易导致转发异常的头
-  const newHeaders = new Headers(req.headers);
-  newHeaders.delete('x-forwarded-for');
-  newHeaders.delete('x-real-ip');
-  newHeaders.delete('host');
-  newHeaders.delete('content-length');
-  newHeaders.delete('cf-connecting-ip');
-  newHeaders.delete('cf-ipcountry');
-  newHeaders.delete('cf-ray');
-  newHeaders.delete('x-vercel-id');
-  newHeaders.delete('x-vercel-proxied-for');
+  const newHeaders = { ...req.headers };
+  delete newHeaders.host;
+  delete newHeaders.connection;
+  delete newHeaders['content-length'];
+  delete newHeaders['x-forwarded-for'];
+  delete newHeaders['x-real-ip'];
+  delete newHeaders['cf-connecting-ip'];
+  delete newHeaders['cf-ipcountry'];
+  delete newHeaders['cf-ray'];
+  delete newHeaders['x-vercel-id'];
+  delete newHeaders['x-vercel-proxied-for'];
+  delete newHeaders['accept-encoding'];
 
-  // 3. 显式读取原始二进制 body，稳定转发 multipart/form-data
-  let requestBody = undefined;
+  let requestBody;
   if (req.method !== 'GET' && req.method !== 'HEAD') {
-    requestBody = await req.arrayBuffer();
+    requestBody = await readRawBody(req);
   }
 
-  // 4. 转发到 OpenAI
-  const response = await fetch(targetUrl, {
-    method: req.method,
-    headers: newHeaders,
-    body: requestBody,
-    redirect: 'follow'
-  });
+  try {
+    const response = await fetch(targetUrl, {
+      method: req.method,
+      headers: newHeaders,
+      body: requestBody,
+      redirect: 'follow'
+    });
 
-  // 5. 将 OpenAI 返回结果透传回客户端
-  const modifiedResponse = new Response(response.body, response);
-  modifiedResponse.headers.set('Access-Control-Allow-Origin', '*');
-  modifiedResponse.headers.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  modifiedResponse.headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  return modifiedResponse;
+    res.status(response.status);
+    response.headers.forEach((value, key) => {
+      if (key.toLowerCase() === 'content-encoding') {
+        return;
+      }
+      res.setHeader(key, value);
+    });
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+
+    const responseBuffer = Buffer.from(await response.arrayBuffer());
+    res.end(responseBuffer);
+  } catch (error) {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res
+      .status(500)
+      .send(error?.stack || error?.message || 'proxy request failed');
+  }
 }
